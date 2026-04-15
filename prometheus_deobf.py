@@ -11,7 +11,7 @@ try:
 except ImportError:
     HAS_COLOR = False
 
-VERSION = "2.1.1"
+VERSION = "2.1.2"
 
 def log(message, level="info"):
     if HAS_COLOR:
@@ -95,6 +95,7 @@ def resolve_constant_arrays(code, verbose=False):
     for name, elems in arrays.items():
         for i, val in enumerate(elems, 1):
             pat = rf'{re.escape(name)}\[\s*{i}\s*\]'
+            # SAFE: use lambda to avoid backreference interpretation
             new_code, n = re.subn(pat, lambda m: val, code)
             if n:
                 code = new_code
