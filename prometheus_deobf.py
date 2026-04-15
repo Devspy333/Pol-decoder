@@ -11,7 +11,7 @@ try:
 except ImportError:
     HAS_COLOR = False
 
-VERSION = "2.0.0"
+VERSION = "2.1.1"
 
 def log(message, level="info"):
     if HAS_COLOR:
@@ -95,7 +95,7 @@ def resolve_constant_arrays(code, verbose=False):
     for name, elems in arrays.items():
         for i, val in enumerate(elems, 1):
             pat = rf'{re.escape(name)}\[\s*{i}\s*\]'
-            new_code, n = re.subn(pat, val, code)
+            new_code, n = re.subn(pat, lambda m: val, code)
             if n:
                 code = new_code
                 replaced += n
@@ -185,6 +185,88 @@ def reconstruct_string_concat(code, verbose=False):
         log(f"Reconstructed {n} table.concat string fragments", "debug")
     return new_code
 
+def detect_vm_dispatch_loops(code, verbose=False):
+    pattern = r'while\s+true\s+do\s*((?:[^e]|e(?!nd))*?)end'
+    loops = re.findall(pattern, code, re.DOTALL)
+    if verbose and loops:
+        log(f"Found {len(loops)} potential VM dispatch loops", "debug")
+    return code
+
+def devirtualize_accumulator(code, verbose=False):
+    pattern = r'accumulator\s*=\s*([^;]+);\s*(if\s+accumulator\s*<\s*\d+.*?end)'
+    def repl(m):
+        expr = m.group(1)
+        body = m.group(2)
+        body = re.sub(r'accumulator\s*<\s*(\d+)', r'phase < PHASE_\1', body)
+        return f"-- VM state: {expr}\n{body}"
+    new_code, n = re.subn(pattern, repl, code, flags=re.DOTALL)
+    if verbose and n:
+        log(f"Devirtualized {n} accumulator state machines", "debug")
+    return new_code
+
+def flatten_opcode_dispatch(code, verbose=False):
+    pattern = r'local\s+(\w+)\s*=\s*(\w+)\[(\w+)\]\s*;\s*((?:if\s+\1\s*==\s*\d+\s+then.*?end\s*)+)'
+    def repl(m):
+        op_var = m.group(1)
+        array = m.group(2)
+        index = m.group(3)
+        cases = m.group(4)
+        case_pattern = rf'if\s+{re.escape(op_var)}\s*==\s*(\d+)\s+then\s*(.*?)\s*end'
+        case_list = []
+        for cm in re.finditer(case_pattern, cases, re.DOTALL):
+            opcode, body = cm.group(1), cm.group(2)
+            case_list.append(f"    -- OP_{opcode}\n    {body.strip()}")
+        new_body = '\n'.join(case_list)
+        return f"-- VM dispatch from {array}[{index}]\n{new_body}"
+    new_code, n = re.subn(pattern, repl, code, flags=re.DOTALL)
+    if verbose and n:
+        log(f"Flattened {n} opcode dispatch tables", "debug")
+    return new_code
+
+def remove_goto_jumps(code, verbose=False):
+    code, n1 = re.subn(r'goto\s*\[([^\]]+)\]', r'-- indirect goto: \1', code)
+    if verbose and n1:
+        log(f"Removed {n1} indirect goto statements", "debug")
+    return code
+
+def resolve_vm_phases(code, verbose=False):
+    pattern = r'phase\s*=\s*(\w+)\s*;\s*if\s+\1\s*==\s*(\d+)\s+then'
+    new_code, n = re.subn(pattern, r'-- PHASE_\2_START\nif \1 == \2 then', code)
+    if verbose and n:
+        log(f"Marked {n} VM phase transitions", "debug")
+    return new_code
+
+def simulate_vm_bytecode(code, verbose=False):
+    pattern = r'local\s+(\w+)\s*=\s*{([\d,\s]+)}'
+    def repl(m):
+        name = m.group(1)
+        values = m.group(2)
+        nums = re.findall(r'\d+', values)
+        if len(nums) > 20:
+            summary = nums[:10] + ['...'] + nums[-5:]
+        else:
+            summary = nums
+        return f"-- VM BYTECODE {name}: [{', '.join(summary)}]\nlocal {name} = {{{values}}}"
+    new_code, n = re.subn(pattern, repl, code)
+    if verbose and n:
+        log(f"Commented {n} VM bytecode arrays", "debug")
+    return new_code
+
+def vm_deobfuscation_pipeline(code, verbose=False):
+    steps = [
+        detect_vm_dispatch_loops,
+        devirtualize_accumulator,
+        flatten_opcode_dispatch,
+        remove_goto_jumps,
+        resolve_vm_phases,
+        simulate_vm_bytecode,
+    ]
+    for func in steps:
+        if verbose:
+            log(f"VM decoding: {func.__name__}", "debug")
+        code = func(code, verbose)
+    return code
+
 def pretty_print(code, verbose=False):
     lines = []
     indent = 0
@@ -204,20 +286,21 @@ def deobfuscate(code, verbose=False):
         find_and_decrypt_strings,
         resolve_constant_arrays,
         remove_antitamper,
+        vm_deobfuscation_pipeline,
         simplify_control_flow,
         remove_junk,
         demangle_names,
         reconstruct_string_concat,
-        pretty_print,
     ]
     for func in steps:
         if verbose:
             log(f"Running: {func.__name__}", "debug")
         code = func(code, verbose)
+    code = pretty_print(code, verbose)
     return code
 
 def main():
-    parser = argparse.ArgumentParser(description="Prometheus Lua Deobfuscator")
+    parser = argparse.ArgumentParser(description="Prometheus Lua Deobfuscator with VM decoding")
     parser.add_argument("input", help="Input Lua file (obfuscated)")
     parser.add_argument("output", nargs="?", help="Output file (default: input_deobf.lua)")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
