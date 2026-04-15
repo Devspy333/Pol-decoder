@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 import re
-import ast
-import base64
 import sys
 import os
+import argparse
 
-# Fallback if colorama not installed
 try:
     from colorama import Fore, Style, init
     init(autoreset=True)
     HAS_COLOR = True
 except ImportError:
     HAS_COLOR = False
+
+VERSION = "2.0.0"
 
 def log(message, level="info"):
     if HAS_COLOR:
@@ -20,87 +20,92 @@ def log(message, level="info"):
     else:
         print(f"[{level.upper()}] {message}")
 
-class PrometheusStringDecryptor:
+class PrometheusDecryptor:
     def __init__(self):
-        self.lcg_mult = 1103515245
-        self.lcg_inc = 12345
+        self.lcg_mul = 1103515245
+        self.lcg_add = 12345
         self.lcg_mod = 2**45
-        self.xor_mult = 257
+        self.xor_mul = 257
         self.xor_mod = 65537
 
-    def decrypt(self, enc, seed):
+    def decrypt(self, data, seed):
         lcg = seed % self.lcg_mod
         xor = 1
-        res = []
-        for ch in enc:
-            lcg = (lcg * self.lcg_mult + self.lcg_inc) % self.lcg_mod
-            xor = (xor * self.xor_mult) % self.xor_mod
+        out = []
+        for ch in data:
+            lcg = (lcg * self.lcg_mul + self.lcg_add) % self.lcg_mod
+            xor = (xor * self.xor_mul) % self.xor_mod
             if xor == 1:
-                xor = (xor * self.xor_mult) % self.xor_mod
-            key = (lcg + xor) % 256
-            res.append(chr(ord(ch) ^ key))
-        return ''.join(res)
+                xor = (xor * self.xor_mul) % self.xor_mod
+            key = (lcg + xor) & 0xFF
+            out.append(chr(ord(ch) ^ key))
+        return ''.join(out)
 
-def decrypt_prometheus_strings(code, verbose=False):
-    decryptor = PrometheusStringDecryptor()
-    # Multiple patterns to catch different Prometheus versions
+def find_and_decrypt_strings(code, verbose=False):
+    decryptor = PrometheusDecryptor()
     patterns = [
-        # Pattern 1: function name(param) local state = seed
-        r'function\s+([\w_]+)\s*\(\s*([\w_]+)\s*\)\s*local\s+[\w_]+\s*=\s*(\d+)',
-        # Pattern 2: local name = function(param) local state = seed
-        r'local\s+([\w_]+)\s*=\s*function\s*\(\s*([\w_]+)\s*\)\s*local\s+[\w_]+\s*=\s*(\d+)',
-        # Pattern 3: function name(param) local _ = seed (underscore variable)
-        r'function\s+([\w_]+)\s*\(\s*([\w_]+)\s*\)\s*local\s+_\s*=\s*(\d+)',
-        # Pattern 4: simple pattern without local state (just seed as literal)
-        r'function\s+([\w_]+)\s*\(\s*([\w_]+)\s*\)\s*local\s+\w+\s*=\s*(\d+)',
+        r'function\s+([a-zA-Z_][\w]*)\s*\(\s*([a-zA-Z_][\w]*)\s*\)\s*local\s+[a-zA-Z_][\w]*\s*=\s*(\d+)',
+        r'local\s+([a-zA-Z_][\w]*)\s*=\s*function\s*\(\s*([a-zA-Z_][\w]*)\s*\)\s*local\s+[a-zA-Z_][\w]*\s*=\s*(\d+)',
+        r'function\s+([a-zA-Z_][\w]*)\s*\(\s*([a-zA-Z_][\w]*)\s*\)\s*local\s+_\s*=\s*(\d+)',
+        r'local\s+function\s+([a-zA-Z_][\w]*)\s*\(\s*([a-zA-Z_][\w]*)\s*\)\s*local\s+[a-zA-Z_][\w]*\s*=\s*(\d+)',
+        r'function\s+([a-zA-Z_][\w]*)\s*\(\s*([a-zA-Z_][\w]*)\s*\)\s*local\s+[a-zA-Z_][\w]*\s*=\s*(\d+)[^\n]*bit32\.bxor',
     ]
-    found = False
-    for pattern in patterns:
-        matches = list(re.finditer(pattern, code))
-        if matches:
+    total_replaced = 0
+    for pat_idx, pat in enumerate(patterns):
+        matches = list(re.finditer(pat, code))
+        if not matches:
+            continue
+        for m in matches:
+            func_name = m.group(1)
+            seed = int(m.group(3))
             if verbose:
-                log(f"Found decryptor using pattern: {pattern[:50]}...", "debug")
-            for match in matches:
-                func = match.group(1)
-                seed = int(match.group(3))
+                log(f"Found decryptor: {func_name} (seed={seed}) via pattern {pat_idx}", "debug")
+            call_pat = rf'{func_name}\s*\(\s*"([^"]+)"\s*\)'
+            new_code, n = re.subn(call_pat, lambda mm, s=seed: f'"{decryptor.decrypt(mm.group(1), s)}"', code)
+            if n:
+                code = new_code
+                total_replaced += n
                 if verbose:
-                    log(f"  -> Function: {func}, seed: {seed}", "debug")
-                # Replace calls: func("encrypted")
-                call_pat = rf'{func}\s*\(\s*"([^"]+)"\s*\)'
-                new_code = re.sub(call_pat, lambda m, s=seed: f'"{decryptor.decrypt(m.group(1), s)}"', code)
-                if new_code != code:
-                    code = new_code
-                    found = True
-                    if verbose:
-                        log(f"  -> Decrypted {len(re.findall(call_pat, code))} strings", "debug")
-            if found:
-                break
-    if not found and verbose:
-        log("No string decryption pattern matched. Try manually checking the script structure.", "warning")
+                    log(f"Decrypted {n} strings using {func_name}", "debug")
+        if total_replaced:
+            break
+    if verbose and total_replaced == 0:
+        log("No string decryption pattern matched", "warning")
     return code
 
 def resolve_constant_arrays(code, verbose=False):
-    count = 0
-    for match in re.finditer(r'local\s+([\w_]+)\s*=\s*{([^}]+)}', code, re.DOTALL):
-        name, content = match.groups()
+    arrays = {}
+    for m in re.finditer(r'local\s+([a-zA-Z_][\w]*)\s*=\s*{([^}]+)}', code, re.DOTALL):
+        name, content = m.group(1), m.group(2)
         elems = []
-        for elem in re.split(r',\s*(?![^{]*})', content):
-            elem = elem.strip()
-            if elem.startswith(('"', "'")):
-                elems.append(elem)
-            elif elem.isdigit():
-                elems.append(elem)
+        for part in re.split(r',\s*(?![^{]*})', content):
+            part = part.strip()
+            if part.startswith(('"', "'")):
+                elems.append(part)
+            elif part.isdigit() or (part.startswith('-') and part[1:].isdigit()):
+                elems.append(part)
+            elif part in ('true', 'false'):
+                elems.append(part)
             else:
                 elems.append('nil')
-        if len(elems) > 0 and verbose:
+        arrays[name] = elems
+        if verbose:
             log(f"Found constant array {name} with {len(elems)} elements", "debug")
+    replaced = 0
+    for name, elems in arrays.items():
         for i, val in enumerate(elems, 1):
-            new_code = re.sub(rf'{re.escape(name)}\[\s*{i}\s*\]', val, code)
-            if new_code != code:
-                count += 1
+            pat = rf'{re.escape(name)}\[\s*{i}\s*\]'
+            new_code, n = re.subn(pat, val, code)
+            if n:
                 code = new_code
-    if verbose and count > 0:
-        log(f"Resolved {count} constant array references", "debug")
+                replaced += n
+        for m in re.finditer(rf'{re.escape(name)}\[\s*([a-zA-Z_][\w]*)\s*([+-])\s*(\d+)\s*\]', code):
+            comment = f"-- TODO: resolve {name}[{m.group(1)}{m.group(2)}{m.group(3)}]"
+            code = code.replace(m.group(0), comment)
+            if verbose:
+                log(f"Marked unresolved array access: {name}[{m.group(1)}{m.group(2)}{m.group(3)}]", "debug")
+    if verbose and replaced:
+        log(f"Resolved {replaced} constant array accesses", "debug")
     return code
 
 def remove_antitamper(code, verbose=False):
@@ -108,40 +113,28 @@ def remove_antitamper(code, verbose=False):
         (r'pcall\s*\([^)]*\)\s*', ''),
         (r'debug\.getinfo\s*\([^)]*\)\s*', ''),
         (r'debug\.sethook\s*\([^)]*\)\s*', ''),
-        (r'local valid=true;.*?if valid then else.*?end', 'local valid=true;'),
+        (r'local valid\s*=\s*true\s*;.*?if valid then else.*?end', 'local valid = true', re.DOTALL),
+        (r'load\s*\(\s*[^)]*\s*\)\s*\(\)', ''),
+        (r'getfenv\s*\(\s*\)\s*\([^)]*\)', ''),
+        (r'setfenv\s*\(\s*[^,]+,\s*[^)]+\)', ''),
     ]
     removed = 0
-    for pat, repl in patterns:
-        new_code = re.sub(pat, repl, code, flags=re.DOTALL)
-        if new_code != code:
-            removed += 1
+    for pat, repl, *flags in patterns:
+        fl = flags[0] if flags else 0
+        new_code, n = re.subn(pat, repl, code, flags=fl)
+        if n:
             code = new_code
+            removed += n
     if verbose and removed:
-        log(f"Removed {removed} anti‑tamper patterns", "debug")
+        log(f"Removed {removed} anti-tamper patterns", "debug")
     return code
 
 def simplify_control_flow(code, verbose=False):
-    old_len = len(code)
-    code = re.sub(r'else\s+if', 'elseif', code)
-    code = re.sub(r'if\s+(\w+)\s+then\s+\1\s*=\s*\1\s+end', '', code)
-    if verbose and len(code) != old_len:
-        log("Simplified control flow", "debug")
-    return code
-
-def demangle_names(code, verbose=False):
-    mapping = {
-        'V': 'table', 'f': 'func', 'R': 'string', 'O': 'math', 'N': 'num',
-        'X': 'char', 'G': 'table_insert', 'p': 'string_sub', 'i': 'concat',
-        't': 'accumulator', 'K': 'bit32', 'D': 'buffer', 'S': 'state',
-    }
-    changes = 0
-    for old, new in mapping.items():
-        new_code = re.sub(rf'\b{old}\b(?![\'"])', new, code)
-        if new_code != code:
-            changes += 1
-            code = new_code
-    if verbose and changes:
-        log(f"Demangled {changes} variable names", "debug")
+    code, n1 = re.subn(r'else\s+if', 'elseif', code)
+    code, n2 = re.subn(r'if\s+(\w+)\s+then\s+\1\s*=\s*\1\s+end', '', code)
+    code = re.sub(r'(if\s+accumulator\s*<\s*)(-?\d+)', r'\1PHASE_\2', code)
+    if verbose and (n1 or n2):
+        log(f"Simplified control flow (elseif: {n1}, removed dead if: {n2})", "debug")
     return code
 
 def remove_junk(code, verbose=False):
@@ -151,77 +144,106 @@ def remove_junk(code, verbose=False):
         (r'for \w+ = -\d+,#\w+,-?\d+ do end', ''),
         (r'\w+ = \w+ [+-] \d+\s*$', '', re.MULTILINE),
         (r'local \w+ = nil\s*', ''),
+        (r'\w+\s*=\s*\w+\s*[&|^<>]+\s*\w+', ''),
+        (r'local \w+ = \w+ \[\s*\]', ''),
     ]
     removed = 0
     for pat, repl, *flags in patterns:
-        flag = flags[0] if flags else 0
-        new_code = re.sub(pat, repl, code, flags=flag)
-        if new_code != code:
-            removed += 1
+        fl = flags[0] if flags else 0
+        new_code, n = re.subn(pat, repl, code, flags=fl)
+        if n:
             code = new_code
+            removed += n
     if verbose and removed:
         log(f"Removed {removed} junk code patterns", "debug")
     return code
+
+def demangle_names(code, verbose=False):
+    mapping = {
+        'V': 'table', 'f': 'func', 'R': 'string', 'O': 'math', 'N': 'num',
+        'X': 'char', 'G': 'table_insert', 'p': 'string_sub', 'i': 'concat',
+        't': 'accumulator', 'K': 'bit32', 'D': 'buffer', 'S': 'state',
+        'T': 'temp', 'Z': 'result', 'Y': 'io', 'Q': 'flag', 'P': 'position',
+        'W': 'window', 'L': 'length', 'C': 'count', 'M': 'max', 'J': 'jump',
+    }
+    changes = 0
+    for old, new in mapping.items():
+        new_code, n = re.subn(rf'\b{old}\b(?![\'"])', new, code)
+        if n:
+            code = new_code
+            changes += n
+    if verbose and changes:
+        log(f"Demangled {changes} variable names", "debug")
+    return code
+
+def reconstruct_string_concat(code, verbose=False):
+    def repl(m):
+        parts = re.findall(r'"([^"]+)"', m.group(1))
+        return '"' + ''.join(parts) + '"' if parts else m.group(0)
+    new_code, n = re.subn(r'table\.concat\(\{([^}]+)\}\)', repl, code)
+    if n and verbose:
+        log(f"Reconstructed {n} table.concat string fragments", "debug")
+    return new_code
 
 def pretty_print(code, verbose=False):
     lines = []
     indent = 0
     for line in code.splitlines():
-        line = line.strip()
-        if line.startswith(('end', 'until', 'elseif', 'else')):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith(('end', 'until', 'elseif', 'else')):
             indent = max(0, indent - 1)
-        lines.append('    ' * indent + line)
-        if line.endswith('then') or line.endswith('do') or line.startswith('function'):
+        lines.append('    ' * indent + stripped)
+        if stripped.endswith('then') or stripped.endswith('do') or stripped.startswith('function'):
             indent += 1
     return '\n'.join(lines)
 
 def deobfuscate(code, verbose=False):
-    if verbose:
-        log("Starting deobfuscation pipeline...", "info")
     steps = [
-        ("Decrypting strings", decrypt_prometheus_strings),
-        ("Resolving constant arrays", resolve_constant_arrays),
-        ("Removing anti‑tamper", remove_antitamper),
-        ("Simplifying control flow", simplify_control_flow),
-        ("Demangling names", demangle_names),
-        ("Removing junk code", remove_junk),
-        ("Pretty printing", pretty_print),
+        find_and_decrypt_strings,
+        resolve_constant_arrays,
+        remove_antitamper,
+        simplify_control_flow,
+        remove_junk,
+        demangle_names,
+        reconstruct_string_concat,
+        pretty_print,
     ]
-    for name, func in steps:
+    for func in steps:
         if verbose:
-            log(f"Running: {name}", "debug")
+            log(f"Running: {func.__name__}", "debug")
         code = func(code, verbose)
     return code
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python prometheus_deobf.py <input.lua> [output.lua]")
-        print("       Add -v or --verbose for detailed output")
-        sys.exit(1)
-    infile = sys.argv[1]
-    outfile = None
-    verbose = '-v' in sys.argv or '--verbose' in sys.argv
-    # Parse args
-    for i, arg in enumerate(sys.argv[1:], 1):
-        if arg in ('-v', '--verbose'):
-            continue
-        if not outfile and infile != arg:
-            outfile = arg
-    if not outfile:
-        outfile = infile.replace('.lua', '_deobf.lua')
+    parser = argparse.ArgumentParser(description="Prometheus Lua Deobfuscator")
+    parser.add_argument("input", help="Input Lua file (obfuscated)")
+    parser.add_argument("output", nargs="?", help="Output file (default: input_deobf.lua)")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
+    parser.add_argument("--version", action="version", version=f"Pol-decoder {VERSION}")
+    args = parser.parse_args()
+
+    infile = args.input
+    outfile = args.output if args.output else infile.replace('.lua', '_deobf.lua')
     if not os.path.exists(infile):
         log(f"File not found: {infile}", "error")
         sys.exit(1)
+
     with open(infile, 'r', encoding='utf-8', errors='ignore') as f:
         code = f.read()
-    if verbose:
-        log(f"Input file size: {len(code)} bytes", "debug")
-    result = deobfuscate(code, verbose)
-    if result == code and verbose:
-        log("WARNING: No changes were made. The patterns may not match your Prometheus version.", "warning")
-        log("Try manually inspecting the obfuscated script for decryption function patterns.", "warning")
+
+    if args.verbose:
+        log(f"Loaded {len(code)} bytes from {infile}", "debug")
+
+    result = deobfuscate(code, args.verbose)
+
+    if result == code and args.verbose:
+        log("WARNING: No changes were made. The obfuscation pattern may be unsupported.", "warning")
+
     with open(outfile, 'w', encoding='utf-8') as f:
         f.write(result)
+
     log(f"Deobfuscated script written to {outfile}", "info")
 
 if __name__ == "__main__":
